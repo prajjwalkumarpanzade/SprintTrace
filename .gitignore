@@ -25,8 +25,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Streamlit
-.streamlit/
+# Streamlit — do not commit secrets; config.toml is safe to version for deploy
+.streamlit/secrets.toml
 
 # Logs / temp
 *.log

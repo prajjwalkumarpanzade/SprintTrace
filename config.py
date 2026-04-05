@@ -18,7 +18,7 @@ import os
 load_dotenv()
 
 # ── Jira connection ──────────────────────────────────────────────────────────
-JIRA_URL = os.getenv("JIRA_URL", "https://yourcompany.atlassian.net")
+JIRA_URL = os.getenv("JIRA_URL", "")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 JIRA_BOARD_ID = int(os.getenv("JIRA_BOARD_ID", "1"))
@@ -44,7 +44,6 @@ CLIENT_TEAM_MEMBERS: list[str] = [
   "Anuj Santosh Barave",
   "Sumit Waman",
   "Abhishek Jaiswal",
-  "Sakshi Kashyap",
   "Vaibhav Bhattad",
   "Atharva Banasure",
   "Aditya Pansare",
@@ -53,8 +52,10 @@ CLIENT_TEAM_MEMBERS: list[str] = [
   "Yash Deepak Anbhore",
   "Rushikesh Dhaygude",
   "Jigar Makwana",
-  "Mayuresh Chavan",
-  "Ronak Kalavadia"
+  "Mayuresh Nitin Chavan",
+  "Ronak Kalavadia",
+  "anil solankar",
+  "Onkar Mahajan"
     
 ]
 
@@ -92,6 +93,7 @@ SPRINT_ISSUES_STATUS_PRESETS: list[str] = [
     "Merged",
     "QA",
     "Under Review",
+    "Won't Fix",
     "Rework",
     "PR Review",
     "Ready to start",
@@ -125,6 +127,14 @@ STATUS_FILTER_SYNONYMS: dict[str, list[str]] = {
         "Merge",
         "Merged to develop",
         "Merged to main",
+    ],
+    "Won't Fix": [
+        "Wont Fix",
+        "Won't Do",
+        "Cancelled",
+        "Canceled",
+        "Declined",
+        "Rejected",
     ],
     "Rework": [
         "Reopened",

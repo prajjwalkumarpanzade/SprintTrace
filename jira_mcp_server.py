@@ -250,6 +250,17 @@ def _story_points(issue: dict) -> float:
     return 0.0
 
 
+def _issue_fixversion_names(issue: dict) -> set[str]:
+    """Normalize issue fixVersions to a lowercase name set."""
+    fvs = issue.get("fields", {}).get("fixVersions") or []
+    names: set[str] = set()
+    for fv in fvs:
+        name = (fv or {}).get("name")
+        if name and str(name).strip():
+            names.add(str(name).strip().lower())
+    return names
+
+
 def _developer_name(issue: dict) -> str:
     """
     Returns the Developer name from customfield_10084 (the 'Developer' field) only.
@@ -286,14 +297,44 @@ def _is_done(issue: dict) -> bool:
 def _jql_all(jira: Jira, jql: str, fields: list[str], page_size: int = 100) -> list[dict]:
     """Fetch ALL issues matching a JQL query, handling Jira Cloud's 100-per-page cap."""
     all_issues: list[dict] = []
+
+    # Jira Cloud search/jql may omit `total`; use nextPageToken pagination.
+    if getattr(jira, "cloud", False):
+        token = None
+        while True:
+            if token:
+                page = jira.enhanced_jql(
+                    jql=jql,
+                    fields=fields,
+                    nextPageToken=token,
+                    limit=page_size,
+                )
+            else:
+                page = jira.enhanced_jql(
+                    jql=jql,
+                    fields=fields,
+                    limit=page_size,
+                )
+            batch = page.get("issues", [])
+            all_issues.extend(batch)
+            token = page.get("nextPageToken")
+            if not batch or not token:
+                break
+        return all_issues
+
+    # Server/DC fallback with start/total pagination.
     start = 0
     while True:
         page = jira.jql(jql, limit=page_size, start=start, fields=fields)
         batch = page.get("issues", [])
         all_issues.extend(batch)
-        total = page.get("total", 0)
+        total = page.get("total")
         start += len(batch)
-        if start >= total or not batch:
+        if not batch:
+            break
+        if total is not None and start >= int(total):
+            break
+        if total is None and len(batch) < page_size:
             break
     return all_issues
 
@@ -551,6 +592,162 @@ def search_issues(jql: str, max_results: int = 50) -> str:
         return json.dumps({"total": raw.get("total", len(result)), "issues": result})
     except Exception as e:
         log.error("search_issues failed: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+# ── Tool: get_fixversion_coverage ────────────────────────────────────────────
+
+@mcp.tool()
+def get_fixversion_coverage(fix_versions: list[str], project_key: str | None = None) -> str:
+    """Return story-point coverage for one or more FixVersions.
+
+    Coverage = completed points / planned points (done status category).
+    """
+    jira = _get_jira()
+    try:
+        versions = [str(v).strip() for v in (fix_versions or []) if str(v).strip()]
+        if not versions:
+            return json.dumps({
+                "projectKey": project_key or config.JIRA_PROJECT_KEY,
+                "fixVersions": [],
+                "planned": 0.0,
+                "completed": 0.0,
+                "coveragePct": 0.0,
+                "issues": 0,
+                "perTeam": {
+                    "Josh Team": {"planned": 0.0, "completed": 0.0, "coveragePct": 0.0, "issues": 0},
+                    "Client Team": {"planned": 0.0, "completed": 0.0, "coveragePct": 0.0, "issues": 0},
+                },
+            })
+
+        unique_versions = sorted(set(versions))
+        proj = (project_key or config.JIRA_PROJECT_KEY or "").strip()
+        safe_versions = [v.replace('"', '\\"') for v in unique_versions]
+        jql_versions = ", ".join(f'"{v}"' for v in safe_versions)
+        if proj:
+            jql = f'project = "{proj}" AND fixVersion in ({jql_versions})'
+        else:
+            jql = f"fixVersion in ({jql_versions})"
+
+        _fields = [
+            "status",
+            "customfield_10084",  # Developer
+            "customfield_10024", "customfield_10016", "customfield_10028", "customfield_10004",
+            "fixVersions",
+        ]
+        issues = _jql_all(jira, jql, _fields)
+        selected_fv = {v.lower() for v in unique_versions}
+
+        planned = 0.0
+        completed = 0.0
+        per_dev: dict[str, dict[str, float | int]] = {}
+        per_team: dict[str, dict[str, float | int]] = {
+            "Josh Team": {"planned": 0.0, "completed": 0.0, "issues": 0},
+            "Client Team": {"planned": 0.0, "completed": 0.0, "issues": 0},
+        }
+        matched_issue_count = 0
+        for issue in issues:
+            # Strict release match: include only issues tagged with selected FixVersion(s).
+            issue_fv = _issue_fixversion_names(issue)
+            if not (issue_fv & selected_fv):
+                continue
+            matched_issue_count += 1
+            pts = _story_points(issue)
+            done = _is_done(issue)
+            planned += pts
+            if done:
+                completed += pts
+
+            dev = _developer_name(issue)
+            d = per_dev.setdefault(dev, {"planned": 0.0, "completed": 0.0, "issues": 0})
+            d["planned"] = float(d["planned"]) + pts
+            if done:
+                d["completed"] = float(d["completed"]) + pts
+            d["issues"] = int(d["issues"]) + 1
+
+            team = _team_of(dev)
+            if team in per_team:
+                t = per_team[team]
+                t["planned"] = float(t["planned"]) + pts
+                if done:
+                    t["completed"] = float(t["completed"]) + pts
+                t["issues"] = int(t["issues"]) + 1
+
+        pct = round((completed / planned * 100.0) if planned else 0.0, 1)
+        for t in per_team.values():
+            tp = float(t["planned"])
+            tc = float(t["completed"])
+            t["coveragePct"] = round((tc / tp * 100.0) if tp else 0.0, 1)
+        return json.dumps({
+            "projectKey": proj,
+            "fixVersions": unique_versions,
+            "planned": planned,
+            "completed": completed,
+            "coveragePct": pct,
+            "issues": matched_issue_count,
+            "perTeam": per_team,
+            "perDeveloper": per_dev,
+        })
+    except Exception as e:
+        log.error("get_fixversion_coverage failed: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+# ── Tool: get_fixversion_issues ───────────────────────────────────────────────
+
+@mcp.tool()
+def get_fixversion_issues(fix_versions: list[str], project_key: str | None = None) -> str:
+    """Return issue-level data for one or more FixVersions (same shape as sprint issues rows)."""
+    jira = _get_jira()
+    try:
+        versions = [str(v).strip() for v in (fix_versions or []) if str(v).strip()]
+        if not versions:
+            return json.dumps({"fixVersions": [], "issues": []})
+
+        unique_versions = sorted(set(versions))
+        proj = (project_key or config.JIRA_PROJECT_KEY or "").strip()
+        safe_versions = [v.replace('"', '\\"') for v in unique_versions]
+        jql_versions = ", ".join(f'"{v}"' for v in safe_versions)
+        if proj:
+            jql = f'project = "{proj}" AND fixVersion in ({jql_versions}) ORDER BY created'
+        else:
+            jql = f"fixVersion in ({jql_versions}) ORDER BY created"
+
+        _fields = [
+            "summary", "status",
+            "customfield_10084",  # Developer
+            "customfield_10024", "customfield_10016", "customfield_10028", "customfield_10004",
+            "issuetype", "priority", "fixVersions",
+        ]
+        issues = _jql_all(jira, jql, _fields)
+        selected_fv = {v.lower() for v in unique_versions}
+
+        result: list[dict] = []
+        for issue in issues:
+            issue_fv = _issue_fixversion_names(issue)
+            if not (issue_fv & selected_fv):
+                continue
+            dev_name = _developer_name(issue)
+            result.append({
+                "key": issue.get("key"),
+                "summary": issue.get("fields", {}).get("summary", ""),
+                "status": issue.get("fields", {}).get("status", {}).get("name", ""),
+                "statusCategory": (
+                    issue.get("fields", {})
+                    .get("status", {})
+                    .get("statusCategory", {})
+                    .get("key", "")
+                ),
+                "developerName": dev_name,
+                "team": _team_of(dev_name),
+                "storyPoints": _story_points(issue),
+                "done": _is_done(issue),
+                "issueType": issue.get("fields", {}).get("issuetype", {}).get("name", ""),
+                "matchedFixVersions": sorted(issue_fv & selected_fv),
+            })
+        return json.dumps({"fixVersions": unique_versions, "issues": result})
+    except Exception as e:
+        log.error("get_fixversion_issues failed: %s", e)
         return json.dumps({"error": str(e)})
 
 

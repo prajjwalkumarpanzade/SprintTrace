@@ -53,9 +53,11 @@ CLIENT_TEAM_MEMBERS = [
 ]
 ```
 
-**Sprint list (dashboard):** We load **all** active, closed, and future sprints for the board (paginated), keep names matching **`CRM_2.<n>`** per config, optionally trim **closed** by **`DASHBOARD_CLOSED_SPRINT_MAX_MONTHS`** (default **`None`** = no time cut), then **merge** everything and sort by **recency**: **closed** by completion (`completeDate` → `endDate` → `startDate`); **active / future** by **start → end** (then sprint id as tie-breaker). The dropdown shows only the top **`DASHBOARD_CLOSED_SPRINT_LIMIT`** (default **10**) from that merged list—so you get the **10 most recently relevant** CRM sprints, not “active, then 10 old closed”. **`JIRA_SPRINT_ENRICH_GET_CALLS`**: fill missing dates via `GET /rest/agile/1.0/sprint/{id}` so sorting is correct.
+**Sprint list (dashboard):** Active + future are fetched normally. Closed sprints are fetched from the **tail** of Jira’s closed list (`JIRA_CLOSED_SPRINT_TAIL_SIZE`, default 50), then merged and sorted by recency. The selector shows the top **`DASHBOARD_CLOSED_SPRINT_LIMIT`** (default 10) after filtering.
 
 **Sprint names:** **`DASHBOARD_SPRINT_MIN_CRM_2_PATCH`** (default **60**) and optional **`DASHBOARD_SPRINT_MAX_CRM_2_PATCH`** (default **`None`**) restrict the numeric part (e.g. min **60** → **`CRM_2.60`** onward including **`CRM_2.70`**; max **69** → only **`CRM_2.60`–`CRM_2.69`**). Set both min/max to **`None`** to disable the name filter.
+
+**Release month view (CSV):** Add `release_calendar.csv` (see sample file in repo) with at least `Deployment` and `FixVersion` columns. Sidebar month filter uses Deployment month and computes month-level story-point coverage across all FixVersions in that month.
 
 **Issue search:** The **`search_issues`** tool uses Jira **JQL** (`/rest/api/3/search/jql` on Cloud). It returns **issues**, not sprint metadata. To reason about sprints via JQL, use clauses like `sprint in closedSprints()` or `sprint = 12345` and inspect each issue’s `sprint` field in the result.
 

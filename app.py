@@ -11,6 +11,7 @@ import io
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -40,6 +41,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Hide Plotly modebar (zoom, pan, download, reset axes, etc.) on all charts.
+PLOTLY_CHART_CONFIG: dict = {
+    "displayModeBar": False,
+}
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 
@@ -317,6 +323,78 @@ def fetch_velocity(num_sprints: int) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_release_calendar() -> pd.DataFrame:
+    """Load optional release-calendar CSV used for CXO date-range analytics."""
+    csv_path = Path(__file__).with_name("release_calendar.csv")
+    if not csv_path.exists():
+        return pd.DataFrame()
+    # Auto-detect delimiter so both CSV (comma) and pasted TSV work.
+    df = pd.read_csv(csv_path, sep=None, engine="python")
+    if df.empty:
+        return df
+
+    # Normalize common date columns from release plan spreadsheets.
+    for col in ("Sprint Start Date", "Dev Done Date", "Sprit End Date", "Sprint End Date", "Deployment"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    if "Deployment" in df.columns:
+        # Group FixVersions by the Wednesday "dev done" month, not Monday deployment month,
+        # so e.g. 6.3 (dev done Feb, deploy early March) stays with February, not with 7.x in March.
+        if "Dev Done Date" in df.columns:
+            month_source = df["Dev Done Date"].fillna(df["Deployment"])
+        else:
+            month_source = df["Deployment"]
+        df["Month"] = month_source.dt.to_period("M").astype("string")
+    return df
+
+
+def _fixversion_major(version: str) -> int | None:
+    """Leading numeric segment, e.g. '7.1' -> 7, '4.08-performance' -> 4. Unparseable -> None."""
+    raw = str(version).strip().split("-", maxsplit=1)[0].strip()
+    head = raw.split(".", maxsplit=1)[0] if raw else ""
+    return int(head) if head.isdigit() else None
+
+
+def _filter_fix_versions_single_train(versions: list[str]) -> list[str]:
+    """When a month mixes majors (e.g. 7.0-7.3 and 8.0), keep only the lowest-major train."""
+    unique = sorted({v for v in versions if v and str(v).strip()})
+    if len(unique) <= 1:
+        return unique
+    by_major: dict[int, list[str]] = {}
+    for v in unique:
+        m = _fixversion_major(v)
+        if m is None:
+            return unique
+        by_major.setdefault(m, []).append(v)
+    if len(by_major) <= 1:
+        return unique
+    low = min(by_major)
+    return sorted(by_major[low])
+
+
+def fetch_fixversion_coverage(fix_versions: tuple[str, ...]) -> dict:
+    raw = call_tool("get_fixversion_coverage", {"fix_versions": list(fix_versions)})
+    data = json.loads(raw)
+    # Recover from stale in-process registry during hot-reload sessions.
+    if isinstance(data, dict) and "error" in data and "Tool 'get_fixversion_coverage' not found" in str(data["error"]):
+        importlib.reload(mcp_client)
+        retry_raw = mcp_client.call_tool("get_fixversion_coverage", {"fix_versions": list(fix_versions)})
+        return json.loads(retry_raw)
+    return data
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_fixversion_issues(fix_versions: tuple[str, ...]) -> dict:
+    raw = call_tool("get_fixversion_issues", {"fix_versions": list(fix_versions)})
+    data = json.loads(raw)
+    if isinstance(data, dict) and "error" in data and "Tool 'get_fixversion_issues' not found" in str(data["error"]):
+        importlib.reload(mcp_client)
+        retry_raw = mcp_client.call_tool("get_fixversion_issues", {"fix_versions": list(fix_versions)})
+        return json.loads(retry_raw)
+    return data
+
+
 def _status_match_set(canonical: str) -> set[str]:
     """Lowercase Jira status strings for a synonym group (config.STATUS_FILTER_SYNONYMS)."""
     syn = getattr(config, "STATUS_FILTER_SYNONYMS", None) or {}
@@ -325,33 +403,92 @@ def _status_match_set(canonical: str) -> set[str]:
     return {str(x).strip().lower() for x in names if x and str(x).strip()}
 
 
-def _workflow_stage(status: str, done: bool, merged_s: set[str], qa_s: set[str]) -> str:
-    """Bucket an issue for senior-facing charts: Done (Jira done) / Merged / QA / Other."""
+def _workflow_stage(
+    status: str,
+    done: bool,
+    merged_s: set[str],
+    qa_s: set[str],
+    wont_fix_s: set[str],
+    review_s: set[str],
+) -> str:
+    """Bucket issues: Won't Fix / Done / Merged / QA / Under Review (incl. former 'Other')."""
+    s = str(status).strip().lower()
+    if s in wont_fix_s:
+        return "Won't Fix"
     if done:
         return "Done"
-    s = str(status).strip().lower()
     if s in merged_s:
         return "Merged"
     if s in qa_s:
         return "QA"
-    return "Other"
+    if s in review_s:
+        return "Under Review"
+    return "Under Review"
 
 
 def team_workflow_stage_df(issues: list[dict]) -> pd.DataFrame:
-    """Story points by Josh vs Client × workflow stage (uses STATUS_FILTER_SYNONYMS for Merged/QA)."""
+    """Story points by Josh vs Client × workflow stage (STATUS_FILTER_SYNONYMS)."""
     merged_s = _status_match_set("Merged")
     qa_s = _status_match_set("QA")
+    wont_fix_s = _status_match_set("Won't Fix")
+    review_s = _status_match_set("Under Review")
     rows: list[dict] = []
     for i in issues:
         team = i.get("team")
         if team not in ("Josh Team", "Client Team"):
             continue
         pts = float(i.get("storyPoints") or 0)
-        stg = _workflow_stage(str(i.get("status", "")), bool(i.get("done")), merged_s, qa_s)
+        stg = _workflow_stage(
+            str(i.get("status", "")),
+            bool(i.get("done")),
+            merged_s,
+            qa_s,
+            wont_fix_s,
+            review_s,
+        )
         rows.append({"Team": team, "Stage": stg, "Points": pts})
     if not rows:
         return pd.DataFrame(columns=["Team", "Stage", "Points"])
     return pd.DataFrame(rows).groupby(["Team", "Stage"], as_index=False)["Points"].sum()
+
+
+def build_comparison_from_issues(issues: list[dict]) -> dict:
+    """Build team comparison payload from generic issue rows."""
+    teams: dict[str, dict] = {
+        "Josh Team": {"planned": 0.0, "completed": 0.0, "members": {}},
+        "Client Team": {"planned": 0.0, "completed": 0.0, "members": {}},
+        "Other": {"planned": 0.0, "completed": 0.0, "members": {}},
+    }
+    for issue in issues:
+        team = issue.get("team", "Other")
+        if team not in teams:
+            team = "Other"
+        pts = float(issue.get("storyPoints") or 0.0)
+        done = bool(issue.get("done"))
+        dev_name = issue.get("developerName") or "Unassigned"
+
+        t = teams[team]
+        t["planned"] += pts
+        if done:
+            t["completed"] += pts
+
+        member = t["members"].setdefault(dev_name, {"planned": 0.0, "completed": 0.0, "issues": 0})
+        member["planned"] += pts
+        member["issues"] += 1
+        if done:
+            member["completed"] += pts
+
+    summary: dict[str, dict] = {}
+    for team_name, t in teams.items():
+        planned = t["planned"]
+        completed = t["completed"]
+        summary[team_name] = {
+            "planned": planned,
+            "completed": completed,
+            "completionPct": round((completed / planned * 100) if planned else 0, 1),
+            "members": t["members"],
+        }
+    return {"comparison": summary}
 
 
 def _fmt_table_number(val) -> str:
@@ -407,6 +544,8 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         completed = float(row.get("Completed", 0) or 0)
         merged = float(row.get("Merged", 0) or 0)
         qa = float(row.get("QA", 0) or 0)
+        under_review = float(row.get("Under Review", 0) or 0)
+        wont_fix = float(row.get("Won't Fix", 0) or 0)
         remaining = float(row.get("Remaining", 0) or 0)
         done_pct = html_module.escape(str(row.get("Done %", "0%")))
         try:
@@ -416,6 +555,8 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         pill = _completed_pill_class(planned, completed)
         merged_cls = "dev-pill-done--partial" if merged > 0 else "dev-pill-done--zero"
         qa_cls = "dev-pill-done--partial" if qa > 0 else "dev-pill-done--zero"
+        ur_cls = "dev-pill-done--partial" if under_review > 0 else "dev-pill-done--zero"
+        wf_cls = "dev-pill-done--partial" if wont_fix > 0 else "dev-pill-done--zero"
         rows_html.append(
             f"<tr>"
             f'<td class="dev-name">{dev}</td>'
@@ -423,6 +564,8 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
             f'<td class="num"><span class="dev-pill-done {pill}">{_fmt_table_number(completed)}</span></td>'
             f'<td class="num"><span class="dev-pill-done {merged_cls}">{_fmt_table_number(merged)}</span></td>'
             f'<td class="num"><span class="dev-pill-done {qa_cls}">{_fmt_table_number(qa)}</span></td>'
+            f'<td class="num"><span class="dev-pill-done {ur_cls}">{_fmt_table_number(under_review)}</span></td>'
+            f'<td class="num"><span class="dev-pill-done {wf_cls}">{_fmt_table_number(wont_fix)}</span></td>'
             f'<td class="num">{_fmt_table_number(remaining)}</td>'
             f'<td class="num">{done_pct}</td>'
             f'<td class="num">{issues_display}</td>'
@@ -439,6 +582,8 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         '<th class="num">Completed</th>'
         '<th class="num">Merged</th>'
         '<th class="num">QA</th>'
+        '<th class="num">Under Review</th>'
+        '<th class="num">Won\'t Fix</th>'
         '<th class="num">Remaining</th>'
         '<th class="num">Done %</th>'
         '<th class="num">Issues</th>'
@@ -451,34 +596,68 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
+selected_release_month = None
+selected_release_fix_versions: tuple[str, ...] = ()
+
 with st.sidebar:
     st.image("https://cdn.worldvectorlogo.com/logos/jira-1.svg", width=40)
     st.title("SprintTrace")
     st.caption(f"Project: **{config.JIRA_PROJECT_KEY or 'Not set'}**")
+
+    # Sprint selector removed from UI; sprint-based tools default to active sprint.
+    selected_sprint_id = None
+    selected_sprint_label = "Current Active Sprint"
+
     st.divider()
+    st.subheader("Release Month")
+    release_df = load_release_calendar()
+    if release_df.empty:
+        st.caption("Add `release_calendar.csv` to enable month-wise coverage by FixVersion.")
+    elif "Month" not in release_df.columns or "FixVersion" not in release_df.columns:
+        st.warning("release_calendar.csv is missing `Deployment` or `FixVersion` columns.")
+    else:
+        month_options = sorted(
+            [m for m in release_df["Month"].dropna().unique().tolist() if str(m).strip()],
+            reverse=True,
+        )
+        if month_options:
+            current_month_label = (
+                pd.Series([pd.Timestamp.now()], dtype="datetime64[ns]")
+                .dt.to_period("M")
+                .astype("string")
+                .iloc[0]
+            )
+            default_month_index = (
+                month_options.index(current_month_label)
+                if current_month_label in month_options
+                else 0
+            )
+            selected_release_month = st.selectbox(
+                "Select month",
+                month_options,
+                index=default_month_index,
+                help="Uses Dev Done Date month (Wednesday) when set, else Deployment month, from release_calendar.csv. "
+                "Defaults to this calendar month when present.",
+            )
+            month_rows = release_df[release_df["Month"] == selected_release_month]
+            versions = sorted(
+                {
+                    str(v).strip()
+                    for v in month_rows["FixVersion"].dropna().tolist()
+                    if str(v).strip()
+                }
+            )
+            versions = _filter_fix_versions_single_train(versions)
+            selected_release_fix_versions = tuple(versions)
+            st.caption(f"FixVersions in month: {', '.join(versions) if versions else '—'}")
+        else:
+            st.caption("No month values found in `Deployment` column.")
 
     # Config warnings
     if not config.JIRA_API_TOKEN:
         st.error("⚠️ JIRA_API_TOKEN not set in .env")
     if not config.JOSH_TEAM_MEMBERS and not config.CLIENT_TEAM_MEMBERS:
         st.warning("⚠️ No team members configured in config.py — add display names to JOSH_TEAM_MEMBERS and CLIENT_TEAM_MEMBERS")
-
-    st.subheader("Sprint")
-    with st.spinner("Loading sprints..."):
-        sprints = fetch_sprints()
-
-    if sprints:
-        sprint_options = {f"{s['name']} ({s['state']})": s["id"] for s in sprints}
-        labels = list(sprint_options.keys())
-        active_idx = next(
-            (i for i, s in enumerate(sprints) if s.get("state") == "active"), 0
-        )
-        selected_sprint_label = st.selectbox("Select Sprint", labels, index=active_idx)
-        selected_sprint_id = sprint_options[selected_sprint_label]
-    else:
-        st.info("No sprints found. Check your Jira config.")
-        selected_sprint_id = None
-        selected_sprint_label = "—"
 
     st.divider()
     velocity_lookback = st.slider("Velocity lookback (sprints)", 3, 12, config.VELOCITY_SPRINTS_LOOKBACK)
@@ -502,16 +681,58 @@ tab_dashboard, tab_issues, tab_chatbot = st.tabs([
 # ════════════════════════════════════════════════════════════════════════════
 
 with tab_dashboard:
-    st.header(f"Sprint: {selected_sprint_label}")
+    if selected_release_month and selected_release_fix_versions:
+        with st.spinner("Calculating release month coverage..."):
+            cov = fetch_fixversion_coverage(selected_release_fix_versions)
+        if "error" in cov:
+            st.error(f"Release-month coverage error: {cov['error']}")
+        else:
+            st.subheader(f"Release Coverage — {selected_release_month}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("FixVersions", len(cov.get("fixVersions", [])))
+            c2.metric("Planned Points", round(float(cov.get("planned", 0.0)), 1))
+            c3.metric("Covered Points", round(float(cov.get("completed", 0.0)), 1))
+            c4.metric("Coverage %", f"{cov.get('coveragePct', 0)}%")
+            per_team = cov.get("perTeam", {}) if isinstance(cov, dict) else {}
+            j_cov = per_team.get("Josh Team", {}) if isinstance(per_team, dict) else {}
+            c_cov = per_team.get("Client Team", {}) if isinstance(per_team, dict) else {}
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                st.markdown("**Josh Team Coverage**")
+                tj1, tj2, tj3 = st.columns(3)
+                tj1.metric("Planned", round(float(j_cov.get("planned", 0.0)), 1))
+                tj2.metric("Covered", round(float(j_cov.get("completed", 0.0)), 1))
+                tj3.metric("Coverage", f"{j_cov.get('coveragePct', 0)}%")
+            with tc2:
+                st.markdown("**Client Team Coverage**")
+                tcj1, tcj2, tcj3 = st.columns(3)
+                tcj1.metric("Planned", round(float(c_cov.get("planned", 0.0)), 1))
+                tcj2.metric("Covered", round(float(c_cov.get("completed", 0.0)), 1))
+                tcj3.metric("Coverage", f"{c_cov.get('coveragePct', 0)}%")
+            st.caption("Coverage is based on Jira done-status category for issues in selected FixVersions.")
+            st.divider()
 
-    # Fetch comparison + issues (for workflow breakdown chart)
-    with st.spinner("Fetching sprint data..."):
-        comp_data = fetch_comparison(selected_sprint_id)
+    if selected_release_month:
+        st.header(f"Release Month: {selected_release_month}")
+    else:
+        st.header(f"Sprint: {selected_sprint_label}")
+
+    # Fetch dashboard source data
+    with st.spinner("Fetching data..."):
         sprint_issues_for_chart: list[dict] = []
-        if "error" not in comp_data:
-            idata = fetch_sprint_issues(selected_sprint_id)
-            if "error" not in idata:
+        if selected_release_month and selected_release_fix_versions:
+            idata = fetch_fixversion_issues(selected_release_fix_versions)
+            if "error" in idata:
+                comp_data = {"error": idata["error"]}
+            else:
                 sprint_issues_for_chart = idata.get("issues", [])
+                comp_data = build_comparison_from_issues(sprint_issues_for_chart)
+        else:
+            comp_data = fetch_comparison(selected_sprint_id)
+            if "error" not in comp_data:
+                idata = fetch_sprint_issues(selected_sprint_id)
+                if "error" not in idata:
+                    sprint_issues_for_chart = idata.get("issues", [])
 
     if "error" in comp_data:
         st.error(f"Jira error: {comp_data['error']}")
@@ -539,17 +760,19 @@ with tab_dashboard:
         col_left, col_right = st.columns(2)
 
         with col_left:
-            st.subheader("Story points by stage (Merged · QA · Done · Other)")
+            st.subheader("Story points by stage (Under Review · Won't Fix · Merged · QA · Done)")
             st.caption(
-                "Stack shows where sprint points sit: **Done**, **Merged** & **QA** , **Other** = rest in progress."
+                "Stack: **Done** (Jira done), **Merged** / **QA**, **Under Review** (incl. other in-progress), "
+                "**Won't Fix** (see STATUS_FILTER_SYNONYMS)."
             )
             stage_df = team_workflow_stage_df(sprint_issues_for_chart)
             if stage_df.empty:
                 st.info("No Josh/Client issues in this sprint for the stage chart.")
             else:
-                stage_order = ["Other", "Merged", "QA", "Done"]
+                stage_order = ["Under Review", "Won't Fix", "Merged", "QA", "Done"]
                 stage_colors = {
-                    "Other": "#5c6b7a",
+                    "Under Review": "#5c6b7a",
+                    "Won't Fix": "#ef4444",
                     "Merged": "#a78bfa",
                     "QA": "#f59e0b",
                     "Done": "#52d48e",
@@ -573,11 +796,11 @@ with tab_dashboard:
                     uniformtext_minsize=10,
                     uniformtext_mode="hide",
                 )
-                st.plotly_chart(fig_stage, width="stretch")
+                st.plotly_chart(fig_stage, width="stretch", config=PLOTLY_CHART_CONFIG)
 
             st.subheader("Planned vs stages (grouped)")
             bar_rows: list[dict] = []
-            stage_types = ["Merged", "QA", "Done", "Other"]
+            stage_types = ["Under Review", "Won't Fix", "Merged", "QA", "Done"]
             for team_name, pdata in [("Josh Team", josh), ("Client Team", client)]:
                 bar_rows.append({"Team": team_name, "Type": "Planned", "Points": pdata["planned"]})
                 for stg in stage_types:
@@ -587,10 +810,11 @@ with tab_dashboard:
                         pts = float(sel.sum()) if len(sel) else 0.0
                     bar_rows.append({"Team": team_name, "Type": stg, "Points": pts})
             bar_df = pd.DataFrame(bar_rows)
-            bar_type_order = ["Planned", "Other", "Merged", "QA", "Done"]
+            bar_type_order = ["Planned", "Under Review", "Won't Fix", "Merged", "QA", "Done"]
             bar_colors = {
                 "Planned": "#4f8ef7",
-                "Other": "#5c6b7a",
+                "Under Review": "#5c6b7a",
+                "Won't Fix": "#ef4444",
                 "Merged": "#a78bfa",
                 "QA": "#f59e0b",
                 "Done": "#52d48e",
@@ -609,10 +833,10 @@ with tab_dashboard:
                 yaxis_title="Story points",
             )
             st.caption(
-                "**Planned** = all sprint points. **Merged / QA / Done / Other** split the same work by status "
-                "(should add up to Planned per team). **Done** matches completed points in the KPIs."
+                "**Planned** = all sprint points. **Under Review / Won't Fix / Merged / QA / Done** split the same "
+                "work by status (should add up to Planned per team). **Done** matches completed points in the KPIs."
             )
-            st.plotly_chart(fig_bar, width="stretch")
+            st.plotly_chart(fig_bar, width="stretch", config=PLOTLY_CHART_CONFIG)
 
         with col_right:
             st.subheader("Completion %")
@@ -660,29 +884,53 @@ with tab_dashboard:
 
         _merged_set = _status_match_set("Merged")
         _qa_set = _status_match_set("QA")
+        _wont_fix_set = _status_match_set("Won't Fix")
+        _review_set = _status_match_set("Under Review")
 
         def _dev_stage_points(issues: list[dict], team_filter: str) -> dict[str, dict[str, float]]:
-            """From raw sprint issues, compute per-developer Merged / QA points."""
+            """From raw sprint issues, compute per-developer stage points."""
+            empty = {"Merged": 0.0, "QA": 0.0, "Under Review": 0.0, "Won't Fix": 0.0}
             agg: dict[str, dict[str, float]] = {}
             for iss in issues:
                 if iss.get("team") != team_filter:
                     continue
                 dev = iss.get("developerName") or "Unassigned"
                 pts = float(iss.get("storyPoints") or 0)
-                stage = _workflow_stage(str(iss.get("status", "")), bool(iss.get("done")), _merged_set, _qa_set)
-                bucket = agg.setdefault(dev, {"Merged": 0.0, "QA": 0.0})
+                stage = _workflow_stage(
+                    str(iss.get("status", "")),
+                    bool(iss.get("done")),
+                    _merged_set,
+                    _qa_set,
+                    _wont_fix_set,
+                    _review_set,
+                )
+                bucket = agg.setdefault(dev, dict(empty))
                 if stage == "Merged":
                     bucket["Merged"] += pts
                 elif stage == "QA":
                     bucket["QA"] += pts
+                elif stage == "Under Review":
+                    bucket["Under Review"] += pts
+                elif stage == "Won't Fix":
+                    bucket["Won't Fix"] += pts
             return agg
 
         josh_stages = _dev_stage_points(sprint_issues_for_chart, "Josh Team")
         client_stages = _dev_stage_points(sprint_issues_for_chart, "Client Team")
 
-        def members_df(members: dict, stage_map: dict[str, dict[str, float]]) -> pd.DataFrame:
+        def members_df(
+            members: dict,
+            stage_map: dict[str, dict[str, float]],
+            include_names: list[str] | None = None,
+        ) -> pd.DataFrame:
             rows = []
-            for name, stats in members.items():
+            ordered_names: list[str] = []
+            if include_names:
+                ordered_names.extend([n for n in include_names if n and n not in ordered_names])
+            ordered_names.extend([n for n in members.keys() if n and n not in ordered_names])
+
+            for name in ordered_names:
+                stats = members.get(name, {})
                 planned = stats.get("planned", 0)
                 done = stats.get("completed", 0)
                 dev_stages = stage_map.get(name, {})
@@ -692,6 +940,8 @@ with tab_dashboard:
                     "Completed": done,
                     "Merged": dev_stages.get("Merged", 0),
                     "QA": dev_stages.get("QA", 0),
+                    "Under Review": dev_stages.get("Under Review", 0),
+                    "Won't Fix": dev_stages.get("Won't Fix", 0),
                     "Remaining": max(0, planned - done),
                     "Done %": f"{round(done / planned * 100) if planned else 0}%",
                     "Issues": stats.get("issues", 0),
@@ -702,7 +952,11 @@ with tab_dashboard:
             return df
 
         with col_jm:
-            df_j = members_df(josh.get("members", {}), josh_stages)
+            df_j = members_df(
+                josh.get("members", {}),
+                josh_stages,
+                include_names=getattr(config, "JOSH_TEAM_MEMBERS", []),
+            )
             if not df_j.empty:
                 render_developer_table(
                     df_j.rename(columns={"Member": "Developer"}),
@@ -713,7 +967,11 @@ with tab_dashboard:
                 st.info("No Josh Team developers found.")
 
         with col_cm:
-            df_c = members_df(client.get("members", {}), client_stages)
+            df_c = members_df(
+                client.get("members", {}),
+                client_stages,
+                include_names=getattr(config, "CLIENT_TEAM_MEMBERS", []),
+            )
             if not df_c.empty:
                 render_developer_table(
                     df_c.rename(columns={"Member": "Developer"}),
@@ -725,7 +983,7 @@ with tab_dashboard:
 
         st.divider()
 
-        # ── Velocity trend ──
+        # ── Velocity trend (same chart whether or not a release month is selected) ──
         st.subheader(f"Velocity Trend — Last {velocity_lookback} Sprints")
         with st.spinner("Loading velocity..."):
             velocity_data = fetch_velocity(velocity_lookback)
@@ -762,7 +1020,7 @@ with tab_dashboard:
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
             )
-            st.plotly_chart(fig_vel, width="stretch")
+            st.plotly_chart(fig_vel, width="stretch", config=PLOTLY_CHART_CONFIG)
         else:
             st.info("No closed sprints found for velocity chart.")
 

@@ -31,6 +31,8 @@ def _load_tools() -> None:
         "get_all_sprints",
         "get_team_velocity",
         "search_issues",
+        "get_fixversion_coverage",
+        "get_fixversion_issues",
         "get_team_comparison",
         "generate_sprint_report",
     ]:
@@ -137,6 +139,50 @@ def list_tools() -> list[dict]:
                         },
                     },
                     "required": ["jql"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_fixversion_coverage",
+                "description": "Return planned/completed story points for one or more FixVersions, plus per-developer breakdown.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "fix_versions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of FixVersion names.",
+                        },
+                        "project_key": {
+                            "type": "string",
+                            "description": "Optional project key override.",
+                        },
+                    },
+                    "required": ["fix_versions"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_fixversion_issues",
+                "description": "Return issue rows for one or more FixVersions (developer/team/story points/status).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "fix_versions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of FixVersion names.",
+                        },
+                        "project_key": {
+                            "type": "string",
+                            "description": "Optional project key override.",
+                        },
+                    },
+                    "required": ["fix_versions"],
                 },
             },
         },
