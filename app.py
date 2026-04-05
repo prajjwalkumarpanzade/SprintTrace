@@ -410,8 +410,10 @@ def _workflow_stage(
     qa_s: set[str],
     wont_fix_s: set[str],
     review_s: set[str],
+    inprog_s: set[str],
+    todo_s: set[str],
 ) -> str:
-    """Bucket issues: Won't Fix / Done / Merged / QA / Under Review (incl. former 'Other')."""
+    """Bucket issues using STATUS_FILTER_SYNONYMS. Unlisted Jira statuses -> Other (not Under Review)."""
     s = str(status).strip().lower()
     if s in wont_fix_s:
         return "Won't Fix"
@@ -423,7 +425,11 @@ def _workflow_stage(
         return "QA"
     if s in review_s:
         return "Under Review"
-    return "Under Review"
+    if s in inprog_s:
+        return "In Progress"
+    if s in todo_s:
+        return "To Do"
+    return "Other"
 
 
 def team_workflow_stage_df(issues: list[dict]) -> pd.DataFrame:
@@ -432,6 +438,8 @@ def team_workflow_stage_df(issues: list[dict]) -> pd.DataFrame:
     qa_s = _status_match_set("QA")
     wont_fix_s = _status_match_set("Won't Fix")
     review_s = _status_match_set("Under Review")
+    inprog_s = _status_match_set("In Progress")
+    todo_s = _status_match_set("To Do")
     rows: list[dict] = []
     for i in issues:
         team = i.get("team")
@@ -445,6 +453,8 @@ def team_workflow_stage_df(issues: list[dict]) -> pd.DataFrame:
             qa_s,
             wont_fix_s,
             review_s,
+            inprog_s,
+            todo_s,
         )
         rows.append({"Team": team, "Stage": stg, "Points": pts})
     if not rows:
@@ -542,9 +552,12 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         dev = html_module.escape(str(row.get("Developer", "")))
         planned = float(row.get("Planned", 0) or 0)
         completed = float(row.get("Completed", 0) or 0)
+        todo_pts = float(row.get("To Do", 0) or 0)
+        inprog_pts = float(row.get("In Progress", 0) or 0)
+        under_review = float(row.get("Under Review", 0) or 0)
+        other_st = float(row.get("Other", 0) or 0)
         merged = float(row.get("Merged", 0) or 0)
         qa = float(row.get("QA", 0) or 0)
-        under_review = float(row.get("Under Review", 0) or 0)
         wont_fix = float(row.get("Won't Fix", 0) or 0)
         remaining = float(row.get("Remaining", 0) or 0)
         done_pct = html_module.escape(str(row.get("Done %", "0%")))
@@ -553,18 +566,24 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         except (TypeError, ValueError):
             issues_display = html_module.escape(str(row.get("Issues", "")))
         pill = _completed_pill_class(planned, completed)
+        td_cls = "dev-pill-done--partial" if todo_pts > 0 else "dev-pill-done--zero"
+        ip_cls = "dev-pill-done--partial" if inprog_pts > 0 else "dev-pill-done--zero"
+        ur_cls = "dev-pill-done--partial" if under_review > 0 else "dev-pill-done--zero"
+        oth_cls = "dev-pill-done--partial" if other_st > 0 else "dev-pill-done--zero"
         merged_cls = "dev-pill-done--partial" if merged > 0 else "dev-pill-done--zero"
         qa_cls = "dev-pill-done--partial" if qa > 0 else "dev-pill-done--zero"
-        ur_cls = "dev-pill-done--partial" if under_review > 0 else "dev-pill-done--zero"
         wf_cls = "dev-pill-done--partial" if wont_fix > 0 else "dev-pill-done--zero"
         rows_html.append(
             f"<tr>"
             f'<td class="dev-name">{dev}</td>'
             f'<td class="num">{_fmt_table_number(planned)}</td>'
             f'<td class="num"><span class="dev-pill-done {pill}">{_fmt_table_number(completed)}</span></td>'
+            f'<td class="num"><span class="dev-pill-done {td_cls}">{_fmt_table_number(todo_pts)}</span></td>'
+            f'<td class="num"><span class="dev-pill-done {ip_cls}">{_fmt_table_number(inprog_pts)}</span></td>'
+            f'<td class="num"><span class="dev-pill-done {ur_cls}">{_fmt_table_number(under_review)}</span></td>'
+            f'<td class="num"><span class="dev-pill-done {oth_cls}">{_fmt_table_number(other_st)}</span></td>'
             f'<td class="num"><span class="dev-pill-done {merged_cls}">{_fmt_table_number(merged)}</span></td>'
             f'<td class="num"><span class="dev-pill-done {qa_cls}">{_fmt_table_number(qa)}</span></td>'
-            f'<td class="num"><span class="dev-pill-done {ur_cls}">{_fmt_table_number(under_review)}</span></td>'
             f'<td class="num"><span class="dev-pill-done {wf_cls}">{_fmt_table_number(wont_fix)}</span></td>'
             f'<td class="num">{_fmt_table_number(remaining)}</td>'
             f'<td class="num">{done_pct}</td>'
@@ -580,9 +599,12 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         "<th>Developer</th>"
         '<th class="num">Planned</th>'
         '<th class="num">Completed</th>'
+        '<th class="num">To Do</th>'
+        '<th class="num">In Progress</th>'
+        '<th class="num">Under Review</th>'
+        '<th class="num">Other</th>'
         '<th class="num">Merged</th>'
         '<th class="num">QA</th>'
-        '<th class="num">Under Review</th>'
         '<th class="num">Won\'t Fix</th>'
         '<th class="num">Remaining</th>'
         '<th class="num">Done %</th>'
@@ -760,18 +782,32 @@ with tab_dashboard:
         col_left, col_right = st.columns(2)
 
         with col_left:
-            st.subheader("Story points by stage (Under Review · Won't Fix · Merged · QA · Done)")
+            st.subheader(
+                "Story points by stage (To Do · In Progress · Under Review · Other · Won't Fix · Merged · QA · Done)"
+            )
             st.caption(
-                "Stack: **Done** (Jira done), **Merged** / **QA**, **Under Review** (incl. other in-progress), "
-                "**Won't Fix** (see STATUS_FILTER_SYNONYMS)."
+                "**Under Review** = only statuses in that synonym group (e.g. PR Review). "
+                "**Other** = story points in Jira statuses not mapped in config.py — add them to the right group there."
             )
             stage_df = team_workflow_stage_df(sprint_issues_for_chart)
             if stage_df.empty:
                 st.info("No Josh/Client issues in this sprint for the stage chart.")
             else:
-                stage_order = ["Under Review", "Won't Fix", "Merged", "QA", "Done"]
+                stage_order = [
+                    "To Do",
+                    "In Progress",
+                    "Under Review",
+                    "Other",
+                    "Won't Fix",
+                    "Merged",
+                    "QA",
+                    "Done",
+                ]
                 stage_colors = {
+                    "To Do": "#64748b",
+                    "In Progress": "#0ea5e9",
                     "Under Review": "#5c6b7a",
+                    "Other": "#475569",
                     "Won't Fix": "#ef4444",
                     "Merged": "#a78bfa",
                     "QA": "#f59e0b",
@@ -800,7 +836,16 @@ with tab_dashboard:
 
             st.subheader("Planned vs stages (grouped)")
             bar_rows: list[dict] = []
-            stage_types = ["Under Review", "Won't Fix", "Merged", "QA", "Done"]
+            stage_types = [
+                "To Do",
+                "In Progress",
+                "Under Review",
+                "Other",
+                "Won't Fix",
+                "Merged",
+                "QA",
+                "Done",
+            ]
             for team_name, pdata in [("Josh Team", josh), ("Client Team", client)]:
                 bar_rows.append({"Team": team_name, "Type": "Planned", "Points": pdata["planned"]})
                 for stg in stage_types:
@@ -810,10 +855,13 @@ with tab_dashboard:
                         pts = float(sel.sum()) if len(sel) else 0.0
                     bar_rows.append({"Team": team_name, "Type": stg, "Points": pts})
             bar_df = pd.DataFrame(bar_rows)
-            bar_type_order = ["Planned", "Under Review", "Won't Fix", "Merged", "QA", "Done"]
+            bar_type_order = ["Planned"] + stage_types
             bar_colors = {
                 "Planned": "#4f8ef7",
+                "To Do": "#64748b",
+                "In Progress": "#0ea5e9",
                 "Under Review": "#5c6b7a",
+                "Other": "#475569",
                 "Won't Fix": "#ef4444",
                 "Merged": "#a78bfa",
                 "QA": "#f59e0b",
@@ -833,8 +881,8 @@ with tab_dashboard:
                 yaxis_title="Story points",
             )
             st.caption(
-                "**Planned** = all sprint points. **Under Review / Won't Fix / Merged / QA / Done** split the same "
-                "work by status (should add up to Planned per team). **Done** matches completed points in the KPIs."
+                "**Planned** = all sprint points. Stages include **Other** for unmapped Jira statuses "
+                "(should add up to Planned per team). **Done** matches KPI completed."
             )
             st.plotly_chart(fig_bar, width="stretch", config=PLOTLY_CHART_CONFIG)
 
@@ -886,10 +934,20 @@ with tab_dashboard:
         _qa_set = _status_match_set("QA")
         _wont_fix_set = _status_match_set("Won't Fix")
         _review_set = _status_match_set("Under Review")
+        _inprog_set = _status_match_set("In Progress")
+        _todo_set = _status_match_set("To Do")
 
         def _dev_stage_points(issues: list[dict], team_filter: str) -> dict[str, dict[str, float]]:
             """From raw sprint issues, compute per-developer stage points."""
-            empty = {"Merged": 0.0, "QA": 0.0, "Under Review": 0.0, "Won't Fix": 0.0}
+            empty = {
+                "To Do": 0.0,
+                "In Progress": 0.0,
+                "Under Review": 0.0,
+                "Other": 0.0,
+                "Merged": 0.0,
+                "QA": 0.0,
+                "Won't Fix": 0.0,
+            }
             agg: dict[str, dict[str, float]] = {}
             for iss in issues:
                 if iss.get("team") != team_filter:
@@ -903,14 +961,22 @@ with tab_dashboard:
                     _qa_set,
                     _wont_fix_set,
                     _review_set,
+                    _inprog_set,
+                    _todo_set,
                 )
                 bucket = agg.setdefault(dev, dict(empty))
-                if stage == "Merged":
+                if stage == "To Do":
+                    bucket["To Do"] += pts
+                elif stage == "In Progress":
+                    bucket["In Progress"] += pts
+                elif stage == "Under Review":
+                    bucket["Under Review"] += pts
+                elif stage == "Other":
+                    bucket["Other"] += pts
+                elif stage == "Merged":
                     bucket["Merged"] += pts
                 elif stage == "QA":
                     bucket["QA"] += pts
-                elif stage == "Under Review":
-                    bucket["Under Review"] += pts
                 elif stage == "Won't Fix":
                     bucket["Won't Fix"] += pts
             return agg
@@ -938,9 +1004,12 @@ with tab_dashboard:
                     "Member": name,
                     "Planned": planned,
                     "Completed": done,
+                    "To Do": dev_stages.get("To Do", 0),
+                    "In Progress": dev_stages.get("In Progress", 0),
+                    "Under Review": dev_stages.get("Under Review", 0),
+                    "Other": dev_stages.get("Other", 0),
                     "Merged": dev_stages.get("Merged", 0),
                     "QA": dev_stages.get("QA", 0),
-                    "Under Review": dev_stages.get("Under Review", 0),
                     "Won't Fix": dev_stages.get("Won't Fix", 0),
                     "Remaining": max(0, planned - done),
                     "Done %": f"{round(done / planned * 100) if planned else 0}%",

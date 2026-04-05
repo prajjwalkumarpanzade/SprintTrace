@@ -107,6 +107,8 @@ SPRINT_ISSUES_STATUS_PRESETS: list[str] = [
 # also treat these *groups* as the same bucket (Jira names vary by project).
 # Key = label in presets; values = other status names on your board that belong with it.
 # Add your exact Jira status strings here if a filter still shows nothing.
+# Dashboard stage charts: any Jira status not matching a group below is counted as **Other**
+# (not Under Review). Under Review points = only this status + its aliases.
 STATUS_FILTER_SYNONYMS: dict[str, list[str]] = {
     "Under Review": [
         "PR Review",
