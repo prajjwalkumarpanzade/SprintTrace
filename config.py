@@ -52,12 +52,15 @@ CLIENT_TEAM_MEMBERS: list[str] = [
   "Yash Deepak Anbhore",
   "Rushikesh Dhaygude",
   "Jigar Makwana",
-  "Mayuresh Nitin Chavan",
-  "Ronak Kalavadia",
-  "anil solankar",
-  "Onkar Mahajan"
-    
+  "Mayuresh Nitin Chavan"
 ]
+
+# ── Team capacity (story-point equivalent) ───────────────────────────────────
+# Story points = (CAPACITY_HOURS_PER_MEMBER × dev count) ÷ HOURS_PER_STORY_POINT
+# Josh uses fixed JOSH_CAPACITY_DEV_COUNT (3). Client uses number of names in CLIENT_TEAM_MEMBERS.
+CAPACITY_HOURS_PER_MEMBER: float = float(os.getenv("CAPACITY_HOURS_PER_MEMBER", "120"))
+HOURS_PER_STORY_POINT: float = float(os.getenv("HOURS_PER_STORY_POINT", "6"))
+JOSH_CAPACITY_DEV_COUNT: int = int(os.getenv("JOSH_CAPACITY_DEV_COUNT", "3"))
 
 # ── Dashboard settings ───────────────────────────────────────────────────────
 VELOCITY_SPRINTS_LOOKBACK = 6   # how many past sprints to show in velocity chart

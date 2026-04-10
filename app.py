@@ -335,9 +335,13 @@ def load_release_calendar() -> pd.DataFrame:
         return df
 
     # Normalize common date columns from release plan spreadsheets.
+    # "-" / blanks must not sit in the same Series as real dates or pandas warns and
+    # parses row-by-row; clean first, then parse (dayfirst matches UK-style calendar CSV).
     for col in ("Sprint Start Date", "Dev Done Date", "Sprit End Date", "Sprint End Date", "Deployment"):
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+            s = df[col].astype(str).str.strip()
+            s = s.mask(s.isin(("-", "", "nan", "None", "<na>")), pd.NA)
+            df[col] = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if "Deployment" in df.columns:
         # Group FixVersions by the Wednesday "dev done" month, not Monday deployment month,
         # so e.g. 6.3 (dev done Feb, deploy early March) stays with February, not with 7.x in March.
@@ -401,6 +405,57 @@ def _status_match_set(canonical: str) -> set[str]:
     aliases = syn.get(canonical, []) or []
     names = [canonical] + list(aliases)
     return {str(x).strip().lower() for x in names if x and str(x).strip()}
+
+
+def _team_member_count(team_label: str) -> int:
+    if team_label == "Josh Team":
+        return len([x for x in getattr(config, "JOSH_TEAM_MEMBERS", []) if x and str(x).strip()])
+    if team_label == "Client Team":
+        return len([x for x in getattr(config, "CLIENT_TEAM_MEMBERS", []) if x and str(x).strip()])
+    return 0
+
+
+def capacity_dev_count(team_label: str) -> int:
+    """Headcount for capacity: Josh = fixed 3 (config); Client = all names in CLIENT_TEAM_MEMBERS."""
+    if team_label == "Josh Team":
+        return max(0, int(getattr(config, "JOSH_CAPACITY_DEV_COUNT", 3) or 0))
+    if team_label == "Client Team":
+        return _team_member_count("Client Team")
+    return 0
+
+
+def team_capacity_story_points(team_label: str) -> float:
+    """Story points = (hours per dev × dev count) ÷ hours per 1 SP."""
+    hrs = float(getattr(config, "CAPACITY_HOURS_PER_MEMBER", 160) or 160)
+    hps = float(getattr(config, "HOURS_PER_STORY_POINT", 8) or 8)
+    n = capacity_dev_count(team_label)
+    if hps <= 0 or n <= 0:
+        return 0.0
+    return round((hrs * n) / hps, 1)
+
+
+def per_member_story_points_split(team_label: str) -> float:
+    """Equal split of team story-point capacity across capacity headcount (developer table)."""
+    cap = team_capacity_story_points(team_label)
+    n = capacity_dev_count(team_label)
+    return round(cap / n, 1) if n else 0.0
+
+
+def capacity_formula_hover_text(team_label: str) -> str:
+    """Tooltip: total hrs × devs ÷ h per SP (shown on metrics and charts)."""
+    hrs = float(getattr(config, "CAPACITY_HOURS_PER_MEMBER", 160) or 160)
+    hps = float(getattr(config, "HOURS_PER_STORY_POINT", 6) or 6)
+    n = capacity_dev_count(team_label)
+    sp = team_capacity_story_points(team_label)
+    if team_label == "Josh Team":
+        who = f"{n} devs "
+    else:
+        who = f"{n} devs"
+    return f"({hrs:g} h × {n} devs) ÷ {hps:g} h per 1 SP = {sp:g} SP — {who}"
+
+
+def completion_pct_vs_capacity(completed: float, capacity: float) -> float:
+    return round((completed / capacity * 100) if capacity > 0 else 0.0, 1)
 
 
 def _workflow_stage(
@@ -542,7 +597,12 @@ def _status_filter_match_set(selected: list[str]) -> set[str]:
     return match
 
 
-def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
+def render_developer_table(
+    df: pd.DataFrame,
+    variant: str,
+    label: str,
+    story_points_tooltip_team: str | None = None,
+) -> None:
     """Styled HTML table for Josh / Client developer breakdown (variant: josh | client)."""
     if df.empty:
         return
@@ -550,7 +610,7 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
     rows_html = []
     for _, row in df.iterrows():
         dev = html_module.escape(str(row.get("Developer", "")))
-        planned = float(row.get("Planned", 0) or 0)
+        sp_cap = float(row.get("Story points", 0) or 0)
         completed = float(row.get("Completed", 0) or 0)
         todo_pts = float(row.get("To Do", 0) or 0)
         inprog_pts = float(row.get("In Progress", 0) or 0)
@@ -565,7 +625,7 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
             issues_display = str(int(float(row.get("Issues", 0) or 0)))
         except (TypeError, ValueError):
             issues_display = html_module.escape(str(row.get("Issues", "")))
-        pill = _completed_pill_class(planned, completed)
+        pill = _completed_pill_class(sp_cap, completed)
         td_cls = "dev-pill-done--partial" if todo_pts > 0 else "dev-pill-done--zero"
         ip_cls = "dev-pill-done--partial" if inprog_pts > 0 else "dev-pill-done--zero"
         ur_cls = "dev-pill-done--partial" if under_review > 0 else "dev-pill-done--zero"
@@ -576,7 +636,7 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         rows_html.append(
             f"<tr>"
             f'<td class="dev-name">{dev}</td>'
-            f'<td class="num">{_fmt_table_number(planned)}</td>'
+            f'<td class="num">{_fmt_table_number(sp_cap)}</td>'
             f'<td class="num"><span class="dev-pill-done {pill}">{_fmt_table_number(completed)}</span></td>'
             f'<td class="num"><span class="dev-pill-done {td_cls}">{_fmt_table_number(todo_pts)}</span></td>'
             f'<td class="num"><span class="dev-pill-done {ip_cls}">{_fmt_table_number(inprog_pts)}</span></td>'
@@ -590,6 +650,11 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
             f'<td class="num">{issues_display}</td>'
             f"</tr>"
         )
+    sp_col_title = ""
+    if story_points_tooltip_team:
+        sp_col_title = (
+            f' title="{html_module.escape(capacity_formula_hover_text(story_points_tooltip_team))}"'
+        )
     table_inner = (
         f'<div class="dev-table-card {card_class}">'
         f'<div class="dev-table-card__head"><span class="dev-table-card__accent"></span>'
@@ -597,7 +662,7 @@ def render_developer_table(df: pd.DataFrame, variant: str, label: str) -> None:
         '<div class="dev-table-card__scroll">'
         "<table class='dev-table'><thead><tr>"
         "<th>Developer</th>"
-        '<th class="num">Planned</th>'
+        f'<th class="num"{sp_col_title}>Story points</th>'
         '<th class="num">Completed</th>'
         '<th class="num">To Do</th>'
         '<th class="num">In Progress</th>'
@@ -704,17 +769,15 @@ tab_dashboard, tab_issues, tab_chatbot = st.tabs([
 
 with tab_dashboard:
     if selected_release_month and selected_release_fix_versions:
-        with st.spinner("Calculating release month coverage..."):
+        with st.spinner("Loading release coverage..."):
             cov = fetch_fixversion_coverage(selected_release_fix_versions)
         if "error" in cov:
             st.error(f"Release-month coverage error: {cov['error']}")
         else:
-            st.subheader(f"Release Coverage — {selected_release_month}")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("FixVersions", len(cov.get("fixVersions", [])))
-            c2.metric("Planned Points", round(float(cov.get("planned", 0.0)), 1))
-            c3.metric("Covered Points", round(float(cov.get("completed", 0.0)), 1))
-            c4.metric("Coverage %", f"{cov.get('coveragePct', 0)}%")
+            st.subheader(f"Release — {selected_release_month}")
+            sz1, sz2 = st.columns(2)
+            sz1.metric("Josh Team size", capacity_dev_count("Josh Team"))
+            sz2.metric("Client Team size", capacity_dev_count("Client Team"))
             per_team = cov.get("perTeam", {}) if isinstance(cov, dict) else {}
             j_cov = per_team.get("Josh Team", {}) if isinstance(per_team, dict) else {}
             c_cov = per_team.get("Client Team", {}) if isinstance(per_team, dict) else {}
@@ -722,22 +785,30 @@ with tab_dashboard:
             with tc1:
                 st.markdown("**Josh Team Coverage**")
                 tj1, tj2, tj3 = st.columns(3)
-                tj1.metric("Planned", round(float(j_cov.get("planned", 0.0)), 1))
+                tj1.metric(
+                    "Story points",
+                    f"{team_capacity_story_points('Josh Team')} pts",
+                    help=capacity_formula_hover_text("Josh Team"),
+                )
                 tj2.metric("Covered", round(float(j_cov.get("completed", 0.0)), 1))
                 tj3.metric("Coverage", f"{j_cov.get('coveragePct', 0)}%")
             with tc2:
                 st.markdown("**Client Team Coverage**")
                 tcj1, tcj2, tcj3 = st.columns(3)
-                tcj1.metric("Planned", round(float(c_cov.get("planned", 0.0)), 1))
+                tcj1.metric(
+                    "Story points",
+                    f"{team_capacity_story_points('Client Team')} pts",
+                    help=capacity_formula_hover_text("Client Team"),
+                )
                 tcj2.metric("Covered", round(float(c_cov.get("completed", 0.0)), 1))
                 tcj3.metric("Coverage", f"{c_cov.get('coveragePct', 0)}%")
-            st.caption("Coverage is based on Jira done-status category for issues in selected FixVersions.")
+            
             st.divider()
 
-    if selected_release_month:
-        st.header(f"Release Month: {selected_release_month}")
-    else:
+    if not selected_release_month:
         st.header(f"Sprint: {selected_sprint_label}")
+    elif not (selected_release_month and selected_release_fix_versions):
+        st.header(f"Release Month: {selected_release_month}")
 
     # Fetch dashboard source data
     with st.spinner("Fetching data..."):
@@ -762,170 +833,6 @@ with tab_dashboard:
         comp = comp_data.get("comparison", {})
         josh = comp.get("Josh Team", {"planned": 0, "completed": 0, "completionPct": 0, "members": {}})
         client = comp.get("Client Team", {"planned": 0, "completed": 0, "completionPct": 0, "members": {}})
-
-        # ── KPI Metrics ──
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Josh Team — Planned", f"{josh['planned']} pts")
-        with col2:
-            delta_j = f"{josh['completionPct']}% done"
-            st.metric("Josh Team — Completed", f"{josh['completed']} pts", delta=delta_j)
-        with col3:
-            st.metric("Client Team — Planned", f"{client['planned']} pts")
-        with col4:
-            delta_c = f"{client['completionPct']}% done"
-            st.metric("Client Team — Completed", f"{client['completed']} pts", delta=delta_c)
-
-        st.divider()
-
-        # ── Comparison bar chart ──
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            st.subheader(
-                "Story points by stage (To Do · In Progress · Under Review · Other · Won't Fix · Merged · QA · Done)"
-            )
-            st.caption(
-                "**Under Review** = only statuses in that synonym group (e.g. PR Review). "
-                "**Other** = story points in Jira statuses not mapped in config.py — add them to the right group there."
-            )
-            stage_df = team_workflow_stage_df(sprint_issues_for_chart)
-            if stage_df.empty:
-                st.info("No Josh/Client issues in this sprint for the stage chart.")
-            else:
-                stage_order = [
-                    "To Do",
-                    "In Progress",
-                    "Under Review",
-                    "Other",
-                    "Won't Fix",
-                    "Merged",
-                    "QA",
-                    "Done",
-                ]
-                stage_colors = {
-                    "To Do": "#64748b",
-                    "In Progress": "#0ea5e9",
-                    "Under Review": "#5c6b7a",
-                    "Other": "#475569",
-                    "Won't Fix": "#ef4444",
-                    "Merged": "#a78bfa",
-                    "QA": "#f59e0b",
-                    "Done": "#52d48e",
-                }
-                fig_stage = px.bar(
-                    stage_df,
-                    x="Team",
-                    y="Points",
-                    color="Stage",
-                    barmode="stack",
-                    category_orders={"Stage": stage_order},
-                    color_discrete_map=stage_colors,
-                    template="plotly_dark",
-                )
-                fig_stage.update_layout(
-                    margin=dict(l=0, r=0, t=12, b=0),
-                    legend=dict(orientation="h", y=1.12, title_text=""),
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    yaxis_title="Story points",
-                    uniformtext_minsize=10,
-                    uniformtext_mode="hide",
-                )
-                st.plotly_chart(fig_stage, width="stretch", config=PLOTLY_CHART_CONFIG)
-
-            st.subheader("Planned vs stages (grouped)")
-            bar_rows: list[dict] = []
-            stage_types = [
-                "To Do",
-                "In Progress",
-                "Under Review",
-                "Other",
-                "Won't Fix",
-                "Merged",
-                "QA",
-                "Done",
-            ]
-            for team_name, pdata in [("Josh Team", josh), ("Client Team", client)]:
-                bar_rows.append({"Team": team_name, "Type": "Planned", "Points": pdata["planned"]})
-                for stg in stage_types:
-                    pts = 0.0
-                    if not stage_df.empty:
-                        sel = stage_df[(stage_df["Team"] == team_name) & (stage_df["Stage"] == stg)]["Points"]
-                        pts = float(sel.sum()) if len(sel) else 0.0
-                    bar_rows.append({"Team": team_name, "Type": stg, "Points": pts})
-            bar_df = pd.DataFrame(bar_rows)
-            bar_type_order = ["Planned"] + stage_types
-            bar_colors = {
-                "Planned": "#4f8ef7",
-                "To Do": "#64748b",
-                "In Progress": "#0ea5e9",
-                "Under Review": "#5c6b7a",
-                "Other": "#475569",
-                "Won't Fix": "#ef4444",
-                "Merged": "#a78bfa",
-                "QA": "#f59e0b",
-                "Done": "#52d48e",
-            }
-            fig_bar = px.bar(
-                bar_df, x="Team", y="Points", color="Type", barmode="group",
-                category_orders={"Type": bar_type_order},
-                color_discrete_map=bar_colors,
-                template="plotly_dark",
-            )
-            fig_bar.update_layout(
-                margin=dict(l=0, r=0, t=20, b=0),
-                legend=dict(orientation="h", y=1.18, title_text=""),
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                yaxis_title="Story points",
-            )
-            st.caption(
-                "**Planned** = all sprint points. Stages include **Other** for unmapped Jira statuses "
-                "(should add up to Planned per team). **Done** matches KPI completed."
-            )
-            st.plotly_chart(fig_bar, width="stretch", config=PLOTLY_CHART_CONFIG)
-
-        with col_right:
-            st.subheader("Completion %")
-            for team_name, team_data, color in [
-                ("Josh Team", josh, "#4f8ef7"),
-                ("Client Team", client, "#f7a24f"),
-            ]:
-                pct = team_data["completionPct"]
-                done = team_data["completed"]
-                planned = team_data["planned"]
-                remaining = max(0, planned - done)
-                bar_html = f"""
-                <div style="margin-bottom:18px;">
-                  <div style="display:flex;justify-content:space-between;
-                              align-items:baseline;margin-bottom:6px;">
-                    <span style="color:{color};font-weight:700;font-size:15px;">
-                      {team_name}
-                    </span>
-                    <span style="color:{color};font-size:26px;font-weight:800;
-                                 letter-spacing:-1px;">
-                      {pct}%
-                    </span>
-                  </div>
-                  <div style="background:#1e2130;border-radius:8px;
-                              height:14px;overflow:hidden;">
-                    <div style="width:{min(pct,100)}%;height:100%;
-                                background:{color};border-radius:8px;
-                                transition:width 0.5s ease;">
-                    </div>
-                  </div>
-                  <div style="display:flex;justify-content:space-between;
-                              margin-top:5px;font-size:12px;color:#8b95b0;">
-                    <span>✅ {done} pts done</span>
-                    <span>⏳ {remaining} pts remaining</span>
-                    <span>📋 {planned} pts total</span>
-                  </div>
-                </div>
-                """
-                st.markdown(bar_html, unsafe_allow_html=True)
-
-        st.divider()
 
         # ── Per-member tables (with Merged / QA columns) ──
         col_jm, col_cm = st.columns(2)
@@ -987,6 +894,7 @@ with tab_dashboard:
         def members_df(
             members: dict,
             stage_map: dict[str, dict[str, float]],
+            team_label: str,
             include_names: list[str] | None = None,
         ) -> pd.DataFrame:
             rows = []
@@ -994,15 +902,15 @@ with tab_dashboard:
             if include_names:
                 ordered_names.extend([n for n in include_names if n and n not in ordered_names])
             ordered_names.extend([n for n in members.keys() if n and n not in ordered_names])
+            sp_each = per_member_story_points_split(team_label)
 
             for name in ordered_names:
                 stats = members.get(name, {})
-                planned = stats.get("planned", 0)
                 done = stats.get("completed", 0)
                 dev_stages = stage_map.get(name, {})
                 rows.append({
                     "Member": name,
-                    "Planned": planned,
+                    "Story points": sp_each,
                     "Completed": done,
                     "To Do": dev_stages.get("To Do", 0),
                     "In Progress": dev_stages.get("In Progress", 0),
@@ -1011,19 +919,20 @@ with tab_dashboard:
                     "Merged": dev_stages.get("Merged", 0),
                     "QA": dev_stages.get("QA", 0),
                     "Won't Fix": dev_stages.get("Won't Fix", 0),
-                    "Remaining": max(0, planned - done),
-                    "Done %": f"{round(done / planned * 100) if planned else 0}%",
+                    "Remaining": max(0, sp_each - done),
+                    "Done %": f"{round(done / sp_each * 100) if sp_each else 0}%",
                     "Issues": stats.get("issues", 0),
                 })
             df = pd.DataFrame(rows)
-            if not df.empty and "Planned" in df.columns:
-                df = df.sort_values("Planned", ascending=False)
+            if not df.empty and "Story points" in df.columns:
+                df = df.sort_values("Story points", ascending=False)
             return df
 
         with col_jm:
             df_j = members_df(
                 josh.get("members", {}),
                 josh_stages,
+                "Josh Team",
                 include_names=getattr(config, "JOSH_TEAM_MEMBERS", []),
             )
             if not df_j.empty:
@@ -1031,6 +940,7 @@ with tab_dashboard:
                     df_j.rename(columns={"Member": "Developer"}),
                     "josh",
                     "Josh Team — Developers",
+                    story_points_tooltip_team="Josh Team",
                 )
             else:
                 st.info("No Josh Team developers found.")
@@ -1039,6 +949,7 @@ with tab_dashboard:
             df_c = members_df(
                 client.get("members", {}),
                 client_stages,
+                "Client Team",
                 include_names=getattr(config, "CLIENT_TEAM_MEMBERS", []),
             )
             if not df_c.empty:
@@ -1046,9 +957,182 @@ with tab_dashboard:
                     df_c.rename(columns={"Member": "Developer"}),
                     "client",
                     "Client Team — Developers",
+                    story_points_tooltip_team="Client Team",
                 )
             else:
                 st.info("No Client Team developers found.")
+
+        st.divider()
+
+        # ── Comparison bar chart ──
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            st.subheader(
+                "Story points by stage (To Do · In Progress · Under Review · Other · Won't Fix · Merged · QA · Done)"
+            )
+            st.caption(
+                "**Under Review** = only statuses in that synonym group (e.g. PR Review). "
+                "**Other** = story points in Jira statuses not mapped in config.py — add them to the right group there."
+            )
+            stage_df = team_workflow_stage_df(sprint_issues_for_chart)
+            if stage_df.empty:
+                st.info("No Josh/Client issues in this sprint for the stage chart.")
+            else:
+                stage_order = [
+                    "To Do",
+                    "In Progress",
+                    "Under Review",
+                    "Other",
+                    "Won't Fix",
+                    "Merged",
+                    "QA",
+                    "Done",
+                ]
+                stage_colors = {
+                    "To Do": "#64748b",
+                    "In Progress": "#0ea5e9",
+                    "Under Review": "#5c6b7a",
+                    "Other": "#475569",
+                    "Won't Fix": "#ef4444",
+                    "Merged": "#a78bfa",
+                    "QA": "#f59e0b",
+                    "Done": "#52d48e",
+                }
+                fig_stage = px.bar(
+                    stage_df,
+                    x="Team",
+                    y="Points",
+                    color="Stage",
+                    barmode="stack",
+                    category_orders={"Stage": stage_order},
+                    color_discrete_map=stage_colors,
+                    template="plotly_dark",
+                )
+                fig_stage.update_layout(
+                    margin=dict(l=0, r=0, t=12, b=0),
+                    legend=dict(orientation="h", y=1.12, title_text=""),
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    yaxis_title="Story points",
+                    uniformtext_minsize=10,
+                    uniformtext_mode="hide",
+                )
+                st.plotly_chart(fig_stage, width="stretch", config=PLOTLY_CHART_CONFIG)
+
+            st.subheader("Story points vs stages (grouped)")
+            bar_rows: list[dict] = []
+            stage_types = [
+                "To Do",
+                "In Progress",
+                "Under Review",
+                "Other",
+                "Won't Fix",
+                "Merged",
+                "QA",
+                "Done",
+            ]
+            for team_name in ("Josh Team", "Client Team"):
+                bar_rows.append({
+                    "Team": team_name,
+                    "Type": "Story points",
+                    "Points": team_capacity_story_points(team_name),
+                    "HoverText": capacity_formula_hover_text(team_name),
+                })
+                for stg in stage_types:
+                    pts = 0.0
+                    if not stage_df.empty:
+                        sel = stage_df[(stage_df["Team"] == team_name) & (stage_df["Stage"] == stg)]["Points"]
+                        pts = float(sel.sum()) if len(sel) else 0.0
+                    bar_rows.append({
+                        "Team": team_name,
+                        "Type": stg,
+                        "Points": pts,
+                        "HoverText": f"Jira — {stg}",
+                    })
+            bar_df = pd.DataFrame(bar_rows)
+            bar_type_order = ["Story points"] + stage_types
+            bar_colors = {
+                "Story points": "#4f8ef7",
+                "To Do": "#64748b",
+                "In Progress": "#0ea5e9",
+                "Under Review": "#5c6b7a",
+                "Other": "#475569",
+                "Won't Fix": "#ef4444",
+                "Merged": "#a78bfa",
+                "QA": "#f59e0b",
+                "Done": "#52d48e",
+            }
+            fig_bar = px.bar(
+                bar_df,
+                x="Team",
+                y="Points",
+                color="Type",
+                barmode="group",
+                category_orders={"Type": bar_type_order},
+                color_discrete_map=bar_colors,
+                template="plotly_dark",
+                custom_data=["HoverText"],
+            )
+            fig_bar.update_traces(
+                hovertemplate=(
+                    "<b>%{fullData.name}</b><br>"
+                    "%{y:.1f} SP<br>"
+                    "%{customdata[0]}"
+                    "<extra></extra>"
+                ),
+            )
+            fig_bar.update_layout(
+                margin=dict(l=0, r=0, t=20, b=0),
+                legend=dict(orientation="h", y=1.18, title_text=""),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                yaxis_title="Story points",
+            )
+            st.caption(
+                "First bar: **Story points** from capacity (hover for formula). Other bars: **Jira** story points "
+                "by status. **Done** = Jira completed points."
+            )
+            st.plotly_chart(fig_bar, width="stretch", config=PLOTLY_CHART_CONFIG)
+
+        with col_right:
+            st.subheader("Completion %")
+            for team_name, team_data, color in [
+                ("Josh Team", josh, "#4f8ef7"),
+                ("Client Team", client, "#f7a24f"),
+            ]:
+                cap = team_capacity_story_points(team_name)
+                done = float(team_data["completed"])
+                pct = completion_pct_vs_capacity(done, cap)
+                remaining = max(0, cap - done)
+                bar_html = f"""
+                <div style="margin-bottom:18px;">
+                  <div style="display:flex;justify-content:space-between;
+                              align-items:baseline;margin-bottom:6px;">
+                    <span style="color:{color};font-weight:700;font-size:15px;">
+                      {team_name}
+                    </span>
+                    <span style="color:{color};font-size:26px;font-weight:800;
+                                 letter-spacing:-1px;">
+                      {pct}%
+                    </span>
+                  </div>
+                  <div style="background:#1e2130;border-radius:8px;
+                              height:14px;overflow:hidden;">
+                    <div style="width:{min(pct,100)}%;height:100%;
+                                background:{color};border-radius:8px;
+                                transition:width 0.5s ease;">
+                    </div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;
+                              margin-top:5px;font-size:12px;color:#8b95b0;">
+                    <span>✅ {done} pts done</span>
+                    <span>⏳ {remaining} pts remaining</span>
+                    <span>📋 {cap} SP (capacity)</span>
+                  </div>
+                </div>
+                """
+                st.markdown(bar_html, unsafe_allow_html=True)
 
         st.divider()
 
@@ -1113,12 +1197,14 @@ with tab_dashboard:
                     summary_df = pd.DataFrame([
                         {"Metric": "Sprint", "Value": report.get("sprintName", "")},
                         {"Metric": "Generated At", "Value": report.get("generatedAt", "")},
-                        {"Metric": "Josh Planned", "Value": report.get("comparison", {}).get("Josh Team", {}).get("planned", 0)},
+                        {"Metric": "Josh Story points (capacity)", "Value": team_capacity_story_points("Josh Team")},
+                        {"Metric": "Josh Jira scope (SP)", "Value": report.get("comparison", {}).get("Josh Team", {}).get("planned", 0)},
                         {"Metric": "Josh Completed", "Value": report.get("comparison", {}).get("Josh Team", {}).get("completed", 0)},
-                        {"Metric": "Josh Completion %", "Value": report.get("comparison", {}).get("Josh Team", {}).get("completionPct", 0)},
-                        {"Metric": "Client Planned", "Value": report.get("comparison", {}).get("Client Team", {}).get("planned", 0)},
+                        {"Metric": "Josh Completion % (vs Jira planned)", "Value": report.get("comparison", {}).get("Josh Team", {}).get("completionPct", 0)},
+                        {"Metric": "Client Story points (capacity)", "Value": team_capacity_story_points("Client Team")},
+                        {"Metric": "Client Jira scope (SP)", "Value": report.get("comparison", {}).get("Client Team", {}).get("planned", 0)},
                         {"Metric": "Client Completed", "Value": report.get("comparison", {}).get("Client Team", {}).get("completed", 0)},
-                        {"Metric": "Client Completion %", "Value": report.get("comparison", {}).get("Client Team", {}).get("completionPct", 0)},
+                        {"Metric": "Client Completion % (vs Jira planned)", "Value": report.get("comparison", {}).get("Client Team", {}).get("completionPct", 0)},
                     ])
                     summary_df.to_excel(writer, sheet_name="Summary", index=False)
 
