@@ -58,9 +58,10 @@ CLIENT_TEAM_MEMBERS: list[str] = [
 # ── Team capacity (story-point equivalent) ───────────────────────────────────
 # Story points = (CAPACITY_HOURS_PER_MEMBER × dev count) ÷ HOURS_PER_STORY_POINT
 # Josh uses fixed JOSH_CAPACITY_DEV_COUNT (3). Client uses number of names in CLIENT_TEAM_MEMBERS.
-CAPACITY_HOURS_PER_MEMBER: float = float(os.getenv("CAPACITY_HOURS_PER_MEMBER", "120"))
-HOURS_PER_STORY_POINT: float = float(os.getenv("HOURS_PER_STORY_POINT", "6"))
+CAPACITY_HOURS_PER_MEMBER: float = float(os.getenv("CAPACITY_HOURS_PER_MEMBER", "160"))
+HOURS_PER_STORY_POINT: float = float(os.getenv("HOURS_PER_STORY_POINT", "8"))
 JOSH_CAPACITY_DEV_COUNT: int = int(os.getenv("JOSH_CAPACITY_DEV_COUNT", "3"))
+JOSH_CAPACITY_HOURS_TOTAL: float = float(os.getenv("JOSH_CAPACITY_HOURS_TOTAL", "400"))
 
 # ── Dashboard settings ───────────────────────────────────────────────────────
 VELOCITY_SPRINTS_LOOKBACK = 6   # how many past sprints to show in velocity chart
@@ -158,6 +159,12 @@ STATUS_FILTER_SYNONYMS: dict[str, list[str]] = {
         "Development",
         "Active",
         "Working",
+    ],
+    "Under UAT": [
+        "UAT",
+        "In UAT",
+        "Ready for UAT",
+        "Ready for uat",
     ],
     "Done": [
         "Closed",

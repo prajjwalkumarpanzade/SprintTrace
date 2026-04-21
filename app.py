@@ -425,13 +425,18 @@ def capacity_dev_count(team_label: str) -> int:
 
 
 def team_capacity_story_points(team_label: str) -> float:
-    """Story points = (hours per dev × dev count) ÷ hours per 1 SP."""
-    hrs = float(getattr(config, "CAPACITY_HOURS_PER_MEMBER", 160) or 160)
+    """Story points = capacity hours ÷ hours per 1 SP."""
+    hrs_per_member = float(getattr(config, "CAPACITY_HOURS_PER_MEMBER", 160) or 160)
+    josh_total_hrs = float(getattr(config, "JOSH_CAPACITY_HOURS_TOTAL", 400) or 400)
     hps = float(getattr(config, "HOURS_PER_STORY_POINT", 8) or 8)
     n = capacity_dev_count(team_label)
-    if hps <= 0 or n <= 0:
+    if hps <= 0:
         return 0.0
-    return round((hrs * n) / hps, 1)
+    if team_label == "Josh Team":
+        total_hrs = max(0.0, josh_total_hrs)
+    else:
+        total_hrs = max(0.0, hrs_per_member) * max(0, n)
+    return round(total_hrs / hps, 1)
 
 
 def per_member_story_points_split(team_label: str) -> float:
@@ -443,15 +448,16 @@ def per_member_story_points_split(team_label: str) -> float:
 
 def capacity_formula_hover_text(team_label: str) -> str:
     """Tooltip: total hrs × devs ÷ h per SP (shown on metrics and charts)."""
-    hrs = float(getattr(config, "CAPACITY_HOURS_PER_MEMBER", 160) or 160)
-    hps = float(getattr(config, "HOURS_PER_STORY_POINT", 6) or 6)
+    hrs_per_member = float(getattr(config, "CAPACITY_HOURS_PER_MEMBER", 160) or 160)
+    josh_total_hrs = float(getattr(config, "JOSH_CAPACITY_HOURS_TOTAL", 400) or 400)
+    hps = float(getattr(config, "HOURS_PER_STORY_POINT", 8) or 8)
     n = capacity_dev_count(team_label)
     sp = team_capacity_story_points(team_label)
     if team_label == "Josh Team":
-        who = f"{n} devs "
-    else:
-        who = f"{n} devs"
-    return f"({hrs:g} h × {n} devs) ÷ {hps:g} h per 1 SP = {sp:g} SP — {who}"
+        total_hrs = max(0.0, josh_total_hrs)
+        return f"{total_hrs:g} h ÷ {hps:g} h per 1 SP = {sp:g} SP"
+    total_hrs = max(0.0, hrs_per_member) * max(0, n)
+    return f"({hrs_per_member:g} h × {n} devs) ÷ {hps:g} h per 1 SP = {sp:g} SP"
 
 
 def completion_pct_vs_capacity(completed: float, capacity: float) -> float:
@@ -771,6 +777,7 @@ with tab_dashboard:
     if selected_release_month and selected_release_fix_versions:
         with st.spinner("Loading release coverage..."):
             cov = fetch_fixversion_coverage(selected_release_fix_versions)
+            idata_for_uat = fetch_fixversion_issues(selected_release_fix_versions)
         if "error" in cov:
             st.error(f"Release-month coverage error: {cov['error']}")
         else:
@@ -781,27 +788,56 @@ with tab_dashboard:
             per_team = cov.get("perTeam", {}) if isinstance(cov, dict) else {}
             j_cov = per_team.get("Josh Team", {}) if isinstance(per_team, dict) else {}
             c_cov = per_team.get("Client Team", {}) if isinstance(per_team, dict) else {}
+
+            issues_for_uat = []
+            if isinstance(idata_for_uat, dict) and "error" not in idata_for_uat:
+                issues_for_uat = idata_for_uat.get("issues", []) or []
+            uat_statuses = _status_match_set("Under UAT")
+            j_uat = round(
+                sum(
+                    float(i.get("storyPoints", 0.0) or 0.0)
+                    for i in issues_for_uat
+                    if str(i.get("team", "")).strip() == "Josh Team"
+                    and str(i.get("status", "")).strip().lower() in uat_statuses
+                ),
+                1,
+            )
+            c_uat = round(
+                sum(
+                    float(i.get("storyPoints", 0.0) or 0.0)
+                    for i in issues_for_uat
+                    if str(i.get("team", "")).strip() == "Client Team"
+                    and str(i.get("status", "")).strip().lower() in uat_statuses
+                ),
+                1,
+            )
             tc1, tc2 = st.columns(2)
             with tc1:
                 st.markdown("**Josh Team Coverage**")
-                tj1, tj2, tj3 = st.columns(3)
+                tj1, tj2, tj3, tj4 = st.columns((1, 1, 1, 1), gap="large")
                 tj1.metric(
                     "Story points",
-                    f"{team_capacity_story_points('Josh Team')} pts",
+                    f"{team_capacity_story_points('Josh Team'):g}",
                     help=capacity_formula_hover_text("Josh Team"),
                 )
                 tj2.metric("Covered", round(float(j_cov.get("completed", 0.0)), 1))
-                tj3.metric("Coverage", f"{j_cov.get('coveragePct', 0)}%")
+                j_completed = float(j_cov.get("completed", 0.0) or 0.0)
+                j_capacity = float(team_capacity_story_points("Josh Team") or 0.0)
+                tj3.metric("Coverage", f"{completion_pct_vs_capacity(j_completed, j_capacity)}%")
+                tj4.metric("UAT", j_uat)
             with tc2:
                 st.markdown("**Client Team Coverage**")
-                tcj1, tcj2, tcj3 = st.columns(3)
+                tcj1, tcj2, tcj3, tcj4 = st.columns((1, 1, 1, 1), gap="large")
                 tcj1.metric(
                     "Story points",
-                    f"{team_capacity_story_points('Client Team')} pts",
+                    f"{team_capacity_story_points('Client Team'):g}",
                     help=capacity_formula_hover_text("Client Team"),
                 )
                 tcj2.metric("Covered", round(float(c_cov.get("completed", 0.0)), 1))
-                tcj3.metric("Coverage", f"{c_cov.get('coveragePct', 0)}%")
+                c_completed = float(c_cov.get("completed", 0.0) or 0.0)
+                c_capacity = float(team_capacity_story_points("Client Team") or 0.0)
+                tcj3.metric("Coverage", f"{completion_pct_vs_capacity(c_completed, c_capacity)}%")
+                tcj4.metric("UAT", c_uat)
             
             st.divider()
 
