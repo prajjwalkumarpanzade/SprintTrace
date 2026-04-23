@@ -294,6 +294,19 @@ def _is_done(issue: dict) -> bool:
     return category == "done"
 
 
+def _is_wont_fix(issue: dict) -> bool:
+    """
+    Detect "Won't Fix" issues for coverage reporting.
+
+    Jira teams sometimes represent Won't Fix as either a terminal Status or a Resolution.
+    We treat either as covered for the FixVersion coverage metric.
+    """
+    fields = issue.get("fields", {}) or {}
+    status_name = str((fields.get("status") or {}).get("name", "")).strip().lower()
+    resolution_name = str((fields.get("resolution") or {}).get("name", "")).strip().lower()
+    return status_name in {"won't fix", "wont fix"} or resolution_name in {"won't fix", "wont fix"}
+
+
 def _jql_all(jira: Jira, jql: str, fields: list[str], page_size: int = 100) -> list[dict]:
     """Fetch ALL issues matching a JQL query, handling Jira Cloud's 100-per-page cap."""
     all_issues: list[dict] = []
@@ -631,6 +644,7 @@ def get_fixversion_coverage(fix_versions: list[str], project_key: str | None = N
 
         _fields = [
             "status",
+            "resolution",
             "customfield_10084",  # Developer
             "customfield_10024", "customfield_10016", "customfield_10028", "customfield_10004",
             "fixVersions",
@@ -654,14 +668,15 @@ def get_fixversion_coverage(fix_versions: list[str], project_key: str | None = N
             matched_issue_count += 1
             pts = _story_points(issue)
             done = _is_done(issue)
+            covered = done or _is_wont_fix(issue)
             planned += pts
-            if done:
+            if covered:
                 completed += pts
 
             dev = _developer_name(issue)
             d = per_dev.setdefault(dev, {"planned": 0.0, "completed": 0.0, "issues": 0})
             d["planned"] = float(d["planned"]) + pts
-            if done:
+            if covered:
                 d["completed"] = float(d["completed"]) + pts
             d["issues"] = int(d["issues"]) + 1
 
@@ -669,7 +684,7 @@ def get_fixversion_coverage(fix_versions: list[str], project_key: str | None = N
             if team in per_team:
                 t = per_team[team]
                 t["planned"] = float(t["planned"]) + pts
-                if done:
+                if covered:
                     t["completed"] = float(t["completed"]) + pts
                 t["issues"] = int(t["issues"]) + 1
 

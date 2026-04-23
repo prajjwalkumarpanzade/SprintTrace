@@ -279,6 +279,57 @@ st.markdown("""
         color: #fbbf24;
         border: 1px solid rgba(245, 158, 11, 0.3);
     }
+
+    /* ── Responsive tweaks ─────────────────────────────────────────────────── */
+    @media (max-width: 768px) {
+        .metric-card {
+            padding: 14px 16px;
+        }
+        .metric-value {
+            font-size: 26px;
+        }
+        [data-testid="stChatMessage"] {
+            padding: 12px 14px !important;
+            max-width: 100%;
+        }
+        .dev-table-card__scroll {
+            max-height: min(62vh, 460px);
+        }
+        table.dev-table {
+            min-width: 560px;
+            font-size: 13px;
+        }
+        table.dev-table thead th,
+        table.dev-table tbody td {
+            padding: 8px 10px;
+        }
+        table.dev-table tbody td.dev-name {
+            max-width: 9rem;
+        }
+        .quick-action-btn button {
+            font-size: 12px !important;
+            padding: 6px 10px !important;
+        }
+    }
+
+    @media (max-width: 480px) {
+        .metric-card {
+            padding: 12px 14px;
+        }
+        .metric-label {
+            font-size: 12px;
+        }
+        .metric-value {
+            font-size: 24px;
+        }
+        table.dev-table {
+            min-width: 520px;
+        }
+        .dev-pill-done {
+            padding: 3px 8px;
+            font-size: 12px;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
